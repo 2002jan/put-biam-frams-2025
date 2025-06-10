@@ -1,0 +1,208 @@
+from deap import tools
+from deap.algorithms import varAnd
+
+import argparse
+import os
+import random
+import sys
+import time
+
+import numpy as np
+import frams
+from deap import creator, base, tools, algorithms
+
+from FramsticksEvolution import ensureDir, save_genotypes, is_feasible_fitness_criteria, \
+    frams_crossover, frams_mutate, selTournament_only_feasible, selNSGA2_only_feasible, frams_getsimplest, \
+    genotype_within_constraint, FITNESS_VALUE_INFEASIBLE_SOLUTION
+from FramsticksLib import FramsticksLib
+import pandas as pd
+
+
+def eaSimple(population, toolbox, cxpb, mutpb, ngen, stats=None, halloffame=None, verbose=__debug__):
+    logbook = tools.Logbook()
+    logbook.header = ['gen', 'nevals'] + (stats.fields if stats else [])
+
+    # Evaluate the individuals with an invalid fitness
+    invalid_ind = [ind for ind in population if not ind.fitness.valid]
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+    for ind, fit in zip(invalid_ind, fitnesses):
+        ind.fitness.values = fit
+
+    if halloffame is not None:
+        halloffame.update(population)
+
+    record = stats.compile(population) if stats else {}
+    logbook.record(gen=0, nevals=len(invalid_ind), **record)
+    if verbose:
+        print(logbook.stream)
+
+    best_pops = []
+
+    best_offspring = sorted(population, key=lambda ind: ind.fitness.values[0], reverse=True)[0]
+    best_pops.append(best_offspring[0])
+
+    # Begin the generational process
+    for gen in range(1, ngen + 1):
+        # Select the next generation individuals
+        offspring = toolbox.select(population, len(population))
+
+        # Vary the pool of individuals
+        offspring = varAnd(offspring, toolbox, cxpb, mutpb)
+
+        # Evaluate the individuals with an invalid fitness
+        invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+        fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+        for ind, fit in zip(invalid_ind, fitnesses):
+            ind.fitness.values = fit
+
+        # Update the hall of fame with the generated individuals
+        if halloffame is not None:
+            halloffame.update(offspring)
+
+        # Replace the current population by the offspring
+        population[:] = offspring
+
+        best_offspring = sorted(population, key=lambda ind: ind.fitness.values[0], reverse=True)[0]
+        best_pops.append(best_offspring[0])
+
+        # Append the current generation statistics to the logbook
+        record = stats.compile(population) if stats else {}
+        logbook.record(gen=gen, nevals=len(invalid_ind), **record)
+        if verbose:
+            print(logbook.stream)
+
+    return population, logbook, best_pops
+
+
+def frams_evaluate(frams_lib, individual):
+    FITNESS_CRITERIA_INFEASIBLE_SOLUTION = [FITNESS_VALUE_INFEASIBLE_SOLUTION] * len(OPTIMIZATION_CRITERIA)  # this special fitness value indicates that the solution should not be propagated via selection ("that genotype is invalid"). The floating point value is only used for compatibility with DEAP. If you implement your own optimization algorithm, instead of a negative value in this constant, use a special value like None to properly distinguish between feasible and infeasible solutions.
+    genotype = individual[0]  # individual[0] because we can't (?) have a simple str as a DEAP genotype/individual, only list of str.
+    data = frams_lib.evaluate([genotype])
+    # print("Evaluated '%s'" % genotype, 'evaluation is:', data)
+    valid = True
+    try:
+        first_genotype_data = data[0]
+        evaluation_data = first_genotype_data["evaluations"]
+        default_evaluation_data = evaluation_data[""]
+        fitness = [default_evaluation_data[crit] for crit in OPTIMIZATION_CRITERIA]
+    except (KeyError, TypeError) as e:  # the evaluation may have failed for an invalid genotype (such as X[@][@] with "Don't simulate genotypes with warnings" option), or because the creature failed to stabilize, or for some other reason
+        valid = False
+        print('Problem "%s" so could not evaluate genotype "%s", hence assigned it a special ("infeasible solution") fitness value: %s' % (str(e), genotype, FITNESS_CRITERIA_INFEASIBLE_SOLUTION))
+    if valid:
+        default_evaluation_data['numgenocharacters'] = len(genotype)  # for consistent constraint checking below
+        valid &= genotype_within_constraint(genotype, default_evaluation_data, 'numparts', parsed_args.max_numparts)
+        valid &= genotype_within_constraint(genotype, default_evaluation_data, 'numjoints', parsed_args.max_numjoints)
+        valid &= genotype_within_constraint(genotype, default_evaluation_data, 'numneurons', parsed_args.max_numneurons)
+        valid &= genotype_within_constraint(genotype, default_evaluation_data, 'numconnections', parsed_args.max_numconnections)
+        valid &= genotype_within_constraint(genotype, default_evaluation_data, 'numgenocharacters', parsed_args.max_numgenochars)
+    if not valid:
+        fitness = FITNESS_CRITERIA_INFEASIBLE_SOLUTION
+    return fitness
+
+
+
+def prepareToolbox(frams_lib, OPTIMIZATION_CRITERIA, tournament_size, genetic_format, initial_genotype):
+    creator.create("FitnessMax", base.Fitness, weights=[1.0] * len(OPTIMIZATION_CRITERIA))
+    creator.create("Individual", list, fitness=creator.FitnessMax)  # would be nice to have "str" instead of unnecessary "list of str"
+
+    toolbox = base.Toolbox()
+    toolbox.register("attr_simplest_genotype", frams_getsimplest, frams_lib, genetic_format, initial_genotype)  # "Attribute generator"
+    # (failed) struggle to have an individual which is a simple str, not a list of str
+    # toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_frams)
+    # https://stackoverflow.com/questions/51451815/python-deap-library-using-random-words-as-individuals
+    # https://github.com/DEAP/deap/issues/339
+    # https://gitlab.com/santiagoandre/deap-customize-population-example/-/blob/master/AGbasic.py
+    # https://groups.google.com/forum/#!topic/deap-users/22g1kyrpKy8
+    toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_simplest_genotype, 1)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    toolbox.register("evaluate", frams_evaluate, frams_lib)
+    toolbox.register("mate", frams_crossover, frams_lib)
+    toolbox.register("mutate", frams_mutate, frams_lib)
+    if len(OPTIMIZATION_CRITERIA) <= 1:
+        # toolbox.register("select", tools.selTournament, tournsize=tournament_size) # without explicitly filtering out infeasible solutions - eliminating/discriminating infeasible solutions during selection would only rely on their relatively poor fitness value
+        toolbox.register("select", selTournament_only_feasible, tournsize=tournament_size)
+    else:
+        # toolbox.register("select", selNSGA2) # without explicitly filtering out infeasible solutions - eliminating/discriminating infeasible solutions during selection would only rely on their relatively poor fitness value
+        toolbox.register("select", selNSGA2_only_feasible)
+    return toolbox
+
+
+def parseArguments():
+    parser = argparse.ArgumentParser(description='Run this program with "python -u %s" if you want to disable buffering of its output.' % sys.argv[0])
+    parser.add_argument('-path', type=ensureDir, required=True, help='Path to Framsticks library without trailing slash.')
+    parser.add_argument('-lib', required=False, help='Library name. If not given, "frams-objects.dll" (or .so or .dylib) is assumed depending on the platform.')
+    parser.add_argument('-sim', required=False, default="eval-allcriteria.sim", help="The name of the .sim file with settings for evaluation, mutation, crossover, and similarity estimation. If not given, \"eval-allcriteria.sim\" is assumed by default. Must be compatible with the \"standard-eval\" expdef. If you want to provide more files, separate them with a semicolon ';'.")
+
+    parser.add_argument('-genformat', required=False, help='Genetic format for the simplest initial genotype, for example 4, 9, or B. If not given, f1 is assumed.')
+    parser.add_argument('-initialgenotype', required=False, help='The genotype used to seed the initial population. If given, the -genformat argument is ignored.')
+
+    parser.add_argument('-opt', required=True, help='optimization criteria: vertpos, velocity, distance, vertvel, lifespan, numjoints, numparts, numneurons, numconnections (or other as long as it is provided by the .sim file and its .expdef). For multiple criteria optimization, separate the names by the comma.')
+    parser.add_argument('-popsize', type=int, default=50, help="Population size, default: 50.")
+    parser.add_argument('-generations', type=int, default=5, help="Number of generations, default: 5.")
+    parser.add_argument('-tournament', type=int, default=5, help="Tournament size, default: 5.")
+    parser.add_argument('-pmut', type=float, default=0.9, help="Probability of mutation, default: 0.9")
+    parser.add_argument('-pxov', type=float, default=0.2, help="Probability of crossover, default: 0.2")
+    parser.add_argument('-hof_size', type=int, default=10, help="Number of genotypes in Hall of Fame. Default: 10.")
+    parser.add_argument('-hof_savefile', required=False, help='If set, Hall of Fame will be saved in Framsticks file format (recommended extension *.gen).')
+
+    parser.add_argument('-max_numparts', type=int, default=None, help="Maximum number of Parts. Default: no limit")
+    parser.add_argument('-max_numjoints', type=int, default=None, help="Maximum number of Joints. Default: no limit")
+    parser.add_argument('-max_numneurons', type=int, default=None, help="Maximum number of Neurons. Default: no limit")
+    parser.add_argument('-max_numconnections', type=int, default=None, help="Maximum number of Neural connections. Default: no limit")
+    parser.add_argument('-max_numgenochars', type=int, default=None, help="Maximum number of characters in genotype (including the format prefix, if any). Default: no limit")
+    parser.add_argument("-run-number", type=int, default=1)
+    return parser.parse_args()
+
+def main():
+    global parsed_args, OPTIMIZATION_CRITERIA  # needed in frams_evaluate(), so made global to avoid passing as arguments
+
+    start_time = time.time()
+    # random.seed(123)  # see FramsticksLib.DETERMINISTIC below, set to True if you want full determinism
+    FramsticksLib.DETERMINISTIC = False  # must be set before FramsticksLib() constructor call
+    parsed_args = parseArguments()
+    print("Argument values:", ", ".join(['%s=%s' % (arg, getattr(parsed_args, arg)) for arg in vars(parsed_args)]))
+    OPTIMIZATION_CRITERIA = parsed_args.opt.split(",")
+    framsLib = FramsticksLib(parsed_args.path, parsed_args.lib, parsed_args.sim)
+    toolbox = prepareToolbox(framsLib, OPTIMIZATION_CRITERIA, parsed_args.tournament, '1' if parsed_args.genformat is None else parsed_args.genformat, parsed_args.initialgenotype)
+    pop = toolbox.population(n=parsed_args.popsize)
+    hof = tools.HallOfFame(parsed_args.hof_size)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    # calculate statistics excluding infeasible solutions (by filtering out these with fitness containing FITNESS_VALUE_INFEASIBLE_SOLUTION)
+    filter_feasible_for_function = lambda function, fitness_criteria: function(list(filter(is_feasible_fitness_criteria, fitness_criteria)))
+    stats.register("avg", lambda fitness_criteria: filter_feasible_for_function(np.mean, fitness_criteria))
+    stats.register("stddev", lambda fitness_criteria: filter_feasible_for_function(np.std, fitness_criteria))
+    stats.register("min", lambda fitness_criteria: filter_feasible_for_function(np.min, fitness_criteria))
+    stats.register("max", lambda fitness_criteria: filter_feasible_for_function(np.max, fitness_criteria))
+    pop, log, best_pop = eaSimple(pop, toolbox, cxpb=parsed_args.pxov, mutpb=parsed_args.pmut, ngen=parsed_args.generations, stats=stats, halloffame=hof, verbose=True)
+    print('Best individuals:')
+    for ind in hof:
+        print(ind.fitness, '\t<--\t', ind[0])
+    if parsed_args.hof_savefile is not None and False:
+        save_genotypes(parsed_args.hof_savefile, OPTIMIZATION_CRITERIA, hof)
+
+    os.makedirs("outputs_lab4", exist_ok=True)
+
+    genes, maxes, stdes = log.select("gen", "max", "stddev")
+
+    file_name = f"outputs_lab4/out_{parsed_args.genformat}_{parsed_args.run_number}.csv"
+
+    run_time = time.time() - start_time
+
+    data = {
+        'gen': genes,
+        'max': maxes,
+        'stdev': stdes,
+        'runtime': [run_time for _ in range(len(genes))],
+        "best_individual": best_pop,
+    }
+
+    df = pd.DataFrame(data, columns=['gen', 'max', 'stdev', 'runtime', 'best_individual'])
+
+    if os.path.exists(file_name):
+        os.remove(file_name)
+
+    df.to_csv(file_name)
+
+
+if __name__ == "__main__":
+    main()
